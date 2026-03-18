@@ -91,7 +91,7 @@ Input (224×224×3)
 1. **Phase 1** — Freeze backbone, train classification head (lr=1e-3, 10 epochs)
 2. **Phase 2** — Unfreeze top 50 backbone layers, fine-tune (lr=5e-5, 30 epochs with early stopping)
 
-Class weights boosted moderate by 1.5× to combat its lower recall.
+Class weights boosted moderate by 1.5× to combat its lower recall. The kaggle notebook including how the model was built can be found [here.](https://www.kaggle.com/code/justindelpup/car-damage-pre)
 
 ---
 

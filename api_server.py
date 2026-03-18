@@ -16,6 +16,7 @@ from PIL import Image
 MODEL_PATH = "car_damage_model.keras"
 CLASS_MAPPING_PATH = "class_mapping.json"
 IMG_SIZE = 224
+CONFIDENCE_THRESHOLD = 0.6
 
 app = FastAPI(title="Car Damage Severity API")
 
@@ -70,8 +71,10 @@ async def predict(file: UploadFile = File(...)):
         for i in range(len(class_names))
     }
 
+    uncertain = confidence < CONFIDENCE_THRESHOLD
+
     return {
-        "prediction": predicted_class,
+        "prediction": "uncertain" if uncertain else predicted_class,
         "confidence": round(confidence, 4),
         "all_probabilities": all_probs,
         "inference_time_ms": round(inference_time, 2)

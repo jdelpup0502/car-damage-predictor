@@ -87,11 +87,35 @@ Input (224×224×3)
   → Dense(3) + Softmax → [minor, moderate, severe]
 ```
 
-**Training strategy:**
+### Standard Training Strategy
+
 1. **Phase 1** — Freeze backbone, train classification head (lr=1e-3, 10 epochs)
 2. **Phase 2** — Unfreeze top 50 backbone layers, fine-tune (lr=5e-5, 30 epochs with early stopping)
 
-Class weights boosted moderate by 1.5× to combat its lower recall. The kaggle notebook including how the model was built can be found [here.](https://www.kaggle.com/code/justindelpup/car-damage-pre)
+Class weights boosted moderate by 1.5× to combat its lower recall.
+
+### Curriculum Learning Training (Experimental)
+
+For improved moderate class accuracy, use multi-stage curriculum learning:
+
+```bash
+python train_curriculum.py --data-dir path/to/training_data
+```
+
+**Curriculum strategy:**
+1. **Stage 1** — Binary: Minor vs Non-minor (learns clear patterns first)
+2. **Stage 2** — Binary: Severe vs Non-severe (learns clear patterns first)
+3. **Stage 3** — 3-class fine-tuning with gradual introduction of ambiguous moderate samples
+
+The `train_curriculum.py` script implements:
+- **Warmup epochs**: Train on clear minor/severe samples only
+- **Gradual curriculum**: Incrementally add moderate samples (20% → 100%)
+- **Label smoothing**: Soft labels for ambiguous moderate samples
+- **Class weighting**: 2× boost for moderate class
+
+Results are saved to `models_curriculum/` directory.
+
+The kaggle notebook including how the model was built can be found [here.](https://www.kaggle.com/code/justindelpup/car-damage-pre)
 
 ---
 
@@ -146,7 +170,25 @@ Or open `http://localhost:8000/docs` for the interactive Swagger UI.
 | `POST` | `/predict` | Upload an image, get damage severity prediction |
 | `GET` | `/docs` | Interactive API documentation (Swagger UI) |
 
+## Training
+
+### Standard Training
+
+```bash
+python api_server.py  # Uses pretrained model by default
+```
+
+### Curriculum Learning Training
+
+```bash
+python train_curriculum.py --data-dir path/to/training_data
+```
+
+Train using multi-stage curriculum learning to improve moderate class accuracy.
+
 ---
+
+## Project Structure
 
 ## Project Structure
 
@@ -156,6 +198,8 @@ car-damage-predictor/
 ├── car_damage_model.keras     # Trained model weights
 ├── class_mapping.json         # Class index → label mapping
 ├── requirements.txt           # Python dependencies
+├── train_curriculum.py        # Curriculum learning training script
+├── evaluate_model.py          # Model evaluation script
 ├── examples/                  # Sample prediction images
 │   ├── minor_example.jpg
 │   ├── moderate_example.jpg
@@ -170,7 +214,6 @@ car-damage-predictor/
 - [ ] Add more training data (label images from other Kaggle datasets)
 - [ ] Build a drag-and-drop web frontend
 - [ ] Dockerize for cloud deployment
-- [ ] Improve moderate class accuracy with curriculum learning
 - [ ] Add damage localization with Grad-CAM heatmaps
 
 ---
@@ -183,6 +226,9 @@ car-damage-predictor/
 - **Dataset:** [prajwalbhamere/car-damage-severity-dataset](https://www.kaggle.com/datasets/prajwalbhamere/car-damage-severity-dataset)
 
 ---
+
+## Notes
+This was built with the help of Claude Opus 4.6 and Qwen-3-coder to gain experience.
 
 <div align="center">
 <sub>Built by <a href="https://github.com/jdelpup0502">jdelpup0502</a></sub>

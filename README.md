@@ -40,12 +40,12 @@ Confidence: <code>93.4%</code>
 <sub>minor: 93.4% · moderate: 6.5% · severe: 0.1%</sub>
 </td>
 <td align="center" width="33%">
-<img src="examples/severe_example_1.jpg" width="280"/>
+<img src="examples/moderate_example.jpg" width="280"/>
 <br><br>
-<b>✅ Severe</b><br>
-Confidence: <code>91.9%</code>
+<b>✅ Moderate</b><br>
+Confidence: <code>62.7%</code>
 <br>
-<sub>minor: 0.1% · moderate: 8.1% · severe: 91.9%</sub>
+<sub>minor: 13.5% · moderate: 62.7% · severe: 23.8%</sub>
 </td>
 <td align="center" width="33%">
 <img src="examples/severe_example_2.jpg" width="280"/>
@@ -158,7 +158,7 @@ car-damage-predictor/
 ├── requirements.txt           # Python dependencies
 ├── examples/                  # Sample prediction images
 │   ├── minor_example.jpg
-│   ├── severe_example_1.jpg
+│   ├── moderate_example.jpg
 │   └── severe_example_2.jpg
 └── README.md
 ```

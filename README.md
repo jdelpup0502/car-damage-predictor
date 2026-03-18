@@ -48,7 +48,7 @@ Confidence: <code>62.7%</code>
 <sub>minor: 13.5% · moderate: 62.7% · severe: 23.8%</sub>
 </td>
 <td align="center" width="33%">
-<img src="examples/severe_example_2.jpg" width="280"/>
+<img src="examples/severe_example_1.jpg" width="280"/>
 <br><br>
 <b>✅ Severe</b><br>
 Confidence: <code>70.3%</code>

@@ -44,7 +44,10 @@ def load_dataset_from_directory(data_dir):
     images = []
     labels = []
 
-    class_names = sorted(os.listdir(data_dir))
+    class_names = sorted(
+        d for d in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, d)) and not d.startswith('.')
+    )
     logger.info(f"Found classes: {class_names}")
 
     for class_idx, class_name in enumerate(class_names):
@@ -109,7 +112,8 @@ def build_model(num_classes=3, freeze_base=True):
     x = layers.Dropout(0.5)(x)
     x = layers.Dense(128, activation='relu')(x)
     x = layers.Dropout(0.3)(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    activation = 'sigmoid' if num_classes == 1 else 'softmax'
+    outputs = layers.Dense(num_classes, activation=activation)(x)
 
     model = models.Model(inputs, outputs)
     return model
@@ -193,9 +197,6 @@ def train_stage1(X_train, y_train, X_val, y_val):
     y_val_binary = create_binary_labels(y_val, MINOR_IDX, [MODERATE_IDX, SEVERE_IDX])
 
     model = build_model(num_classes=1, freeze_base=True)
-
-    # Use sigmoid activation for binary classification
-    model.layers[-1] = layers.Dense(1, activation='sigmoid')
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
         loss='binary_crossentropy',
@@ -221,7 +222,7 @@ def train_stage1(X_train, y_train, X_val, y_val):
     return model, history
 
 
-def train_stage2(X_train, y_train, X_val, y_val, stage1_weights_path=None):
+def train_stage2(X_train, y_train, X_val, y_val):
     """Stage 2: Severe vs Non-severe binary classification."""
     logger.info("=" * 60)
     logger.info("STAGE 2: Severe vs Non-severe Binary Classification")
@@ -232,9 +233,6 @@ def train_stage2(X_train, y_train, X_val, y_val, stage1_weights_path=None):
     y_val_binary = create_binary_labels(y_val, SEVERE_IDX, [MINOR_IDX, MODERATE_IDX])
 
     model = build_model(num_classes=1, freeze_base=True)
-
-    # Use sigmoid activation for binary classification
-    model.layers[-1] = layers.Dense(1, activation='sigmoid')
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
         loss='binary_crossentropy',
@@ -260,83 +258,57 @@ def train_stage2(X_train, y_train, X_val, y_val, stage1_weights_path=None):
     return model, history
 
 
-def train_stage3(X_train, y_train, X_val, y_val,
-                 stage1_model=None, stage2_model=None,
-                 use_curriculum=True):
+def train_stage3(X_train, y_train, X_val, y_val, use_curriculum=True):
     """Stage 3: Full 3-class fine-tuning with curriculum learning.
 
-    Uses a combination of:
-    - Initial training on clear cases (minor + severe)
-    - Gradually introducing ambiguous moderate samples
-    - Soft label smoothing for moderate samples
+    Two-phase approach to prevent catastrophic forgetting:
+    - Phase A: Freeze backbone, train head only (curriculum intro of moderate)
+    - Phase B: Unfreeze top EfficientNet layers, fine-tune end-to-end
     """
     logger.info("=" * 60)
     logger.info("STAGE 3: Full 3-Class Fine-tuning with Curriculum Learning")
     logger.info("=" * 60)
 
-    # Find moderate and non-moderate sample indices
     moderate_indices = np.where(y_train == MODERATE_IDX)[0]
-    non_moderate_indices = np.where(y_train != MODERATE_IDX)[0]
-
     logger.info(f"Training set: {len(y_train)} samples")
     logger.info(f"  - Minor: {np.sum(y_train == MINOR_IDX)}")
     logger.info(f"  - Moderate: {len(moderate_indices)}")
     logger.info(f"  - Severe: {np.sum(y_train == SEVERE_IDX)}")
 
-    # Build model with fine-tuned backbone
-    model = build_model(num_classes=3, freeze_base=False)
-
-    # Unfreeze top blocks of EfficientNet for fine-tuning
-    for layer in model.layers[-20:]:
-        if hasattr(layer, 'trainable'):
-            layer.trainable = True
-
-    # Compute class weights with boost for moderate class
     class_weights = compute_class_weights(y_train, 3)
-    class_weights[MODERATE_IDX] *= 2.0  # Additional boost for moderate class
-
+    class_weights[MODERATE_IDX] *= 2.0
     logger.info(f"Class weights: {class_weights}")
 
-    # Compile with label smoothing for moderate samples
+    validation_data = (X_val, keras.utils.to_categorical(y_val, num_classes=3))
+
+    # ------------------------------------------------------------------ #
+    # Phase A: Frozen backbone — train head only
+    # ------------------------------------------------------------------ #
+    logger.info("\n--- Phase A: Training head with frozen backbone ---")
+    model = build_model(num_classes=3, freeze_base=True)
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=BASE_LEARNING_RATE),
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
         loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
         metrics=['accuracy']
     )
 
-    callbacks = [
+    phase_a_callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor='val_accuracy',
-            patience=5,
-            mode='max',
-            restore_best_weights=True,
-            verbose=1
+            monitor='val_accuracy', patience=5, mode='max',
+            restore_best_weights=True, verbose=1
         ),
         keras.callbacks.ReduceLROnPlateau(
-            monitor='val_accuracy',
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6,
-            verbose=1
+            monitor='val_accuracy', factor=0.5, patience=3,
+            min_lr=1e-6, verbose=1
         )
     ]
 
     if use_curriculum:
-        # Use curriculum scheduler
         scheduler = CurriculumScheduler(
-            len(y_train),
-            moderate_indices,
-            initial_fraction=0.2,
-            final_fraction=1.0,
-            warmup_epochs=3
+            len(y_train), moderate_indices,
+            initial_fraction=0.2, final_fraction=1.0, warmup_epochs=3
         )
 
-        logger.info("Using curriculum learning scheduler")
-        logger.info(f"  Initial moderate fraction: 20%")
-        logger.info(f"  Final moderate fraction: 100%")
-        logger.info(f"  Warmup epochs: 3")
-
-        # Create custom generator for curriculum learning
         class CurriculumDataGenerator(keras.utils.Sequence):
             def __init__(self, X, y, indices_to_use, batch_size):
                 self.X = X
@@ -350,82 +322,105 @@ def train_stage3(X_train, y_train, X_val, y_val,
             def __getitem__(self, idx):
                 batch_indices = self.indices_to_use[idx * self.batch_size:(idx + 1) * self.batch_size]
                 batch_indices = np.array(batch_indices)
-
                 X_batch = augment_batch(self.X[batch_indices])
                 y_batch = keras.utils.to_categorical(self.y[batch_indices], num_classes=3)
-
                 return X_batch, y_batch
 
-            def on_epoch_end(self):
-                # Resample indices for this epoch
-                self.indices_to_use = scheduler.get_samples_for_epoch(
-                    keras.backend.get_value(model.optimizer.iterations) // len(self)
-                )
+        logger.info("Phase A with curriculum scheduler (20% → 100% moderate over warmup)")
+        best_val_acc = 0.0
+        epochs_no_improve = 0
 
-        train_generator = CurriculumDataGenerator(
-            X_train, y_train,
-            scheduler.get_samples_for_epoch(0),
-            BATCH_SIZE
-        )
-
-        validation_data = (X_val, keras.utils.to_categorical(y_val, num_classes=3))
-
-        # Custom training loop with curriculum
-        num_epochs_to_run = EPOCHS_STAGE3
-
-        for epoch in range(num_epochs_to_run):
-            logger.info(f"\n--- Curriculum Epoch {epoch + 1}/{num_epochs_to_run} ---")
-
-            # Update indices for this epoch
+        for epoch in range(EPOCHS_STAGE3):
             current_indices = scheduler.get_samples_for_epoch(epoch)
-            train_generator.indices_to_use = current_indices
+            train_generator = CurriculumDataGenerator(X_train, y_train, current_indices, BATCH_SIZE)
+            n_moderate = len(np.intersect1d(current_indices, moderate_indices))
+            logger.info(f"\n--- Curriculum Epoch {epoch + 1}/{EPOCHS_STAGE3} "
+                        f"({len(current_indices)} samples, {n_moderate} moderate) ---")
 
-            logger.info(f"  Training on {len(current_indices)} samples "
-                       f"({len(np.intersect1d(current_indices, moderate_indices))} moderate)")
-
-            # Train for one epoch
             history = model.fit(
                 train_generator,
                 epochs=epoch + 1,
                 initial_epoch=epoch,
                 validation_data=validation_data,
-                callbacks=callbacks,
+                class_weight=class_weights,
+                callbacks=phase_a_callbacks,
                 verbose=1
             )
 
-            # Check for early stopping
-            if epoch > 3 and len(history.history.get('val_accuracy', [])) > 1:
-                if history.history['val_accuracy'][-1] < max(history.history['val_accuracy'][:-1]) * 0.98:
-                    logger.info("Early stopping triggered in curriculum")
+            val_acc = history.history['val_accuracy'][-1]
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= 5:
+                    logger.info("Early stopping triggered in curriculum phase A")
                     break
     else:
-        # Standard training without curriculum
-        logger.info("Training without curriculum (baseline)")
-        y_train_cat = keras.utils.to_categorical(y_train, num_classes=3)
-        y_val_cat = keras.utils.to_categorical(y_val, num_classes=3)
-
-        train_ds = (
-            tf.data.Dataset.from_tensor_slices((X_train, y_train_cat))
-            .shuffle(len(X_train))
-            .batch(BATCH_SIZE)
-            .map(lambda x, y: (_augmentation(x, training=True), y),
-                 num_parallel_calls=tf.data.AUTOTUNE)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-        val_ds = (
-            tf.data.Dataset.from_tensor_slices((X_val, y_val_cat))
-            .batch(BATCH_SIZE)
-            .prefetch(tf.data.AUTOTUNE)
-        )
-
-        history = model.fit(
-            train_ds,
-            validation_data=val_ds,
+        logger.info("Phase A without curriculum")
+        model.fit(
+            tf.data.Dataset.from_tensor_slices(
+                (X_train, keras.utils.to_categorical(y_train, num_classes=3))
+            ).shuffle(len(X_train)).batch(BATCH_SIZE)
+             .map(lambda x, y: (_augmentation(x, training=True), y),
+                  num_parallel_calls=tf.data.AUTOTUNE)
+             .prefetch(tf.data.AUTOTUNE),
+            validation_data=validation_data,
             epochs=EPOCHS_STAGE3,
             class_weight=class_weights,
-            callbacks=callbacks,
+            callbacks=phase_a_callbacks,
             verbose=1
         )
+
+    logger.info(f"\nPhase A complete. Best val_accuracy: {best_val_acc:.4f}" if use_curriculum
+                else "\nPhase A complete.")
+
+    # ------------------------------------------------------------------ #
+    # Phase B: Unfreeze top EfficientNet layers, fine-tune end-to-end
+    # ------------------------------------------------------------------ #
+    logger.info("\n--- Phase B: Fine-tuning top EfficientNet layers ---")
+    efficientnet = model.get_layer("efficientnetb0")
+    efficientnet.trainable = True
+    # Freeze all but the last 50 layers (same as base model strategy)
+    for layer in efficientnet.layers[:-50]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=BASE_LEARNING_RATE),
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
+        metrics=['accuracy']
+    )
+
+    phase_b_callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_accuracy', patience=7, mode='max',
+            restore_best_weights=True, verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_accuracy', factor=0.5, patience=3,
+            min_lr=1e-7, verbose=1
+        )
+    ]
+
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices(
+            (X_train, keras.utils.to_categorical(y_train, num_classes=3))
+        )
+        .shuffle(len(X_train))
+        .batch(BATCH_SIZE)
+        .map(lambda x, y: (_augmentation(x, training=True), y),
+             num_parallel_calls=tf.data.AUTOTUNE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    model.fit(
+        train_ds,
+        validation_data=validation_data,
+        epochs=30,
+        class_weight=class_weights,
+        callbacks=phase_b_callbacks,
+        verbose=1
+    )
 
     return model
 
@@ -436,14 +431,15 @@ def main(data_dir=None, output_dir='models_curriculum'):
 
     parser = argparse.ArgumentParser(description='Multi-stage curriculum learning for car damage severity')
     parser.add_argument('--data-dir', type=str, help='Path to training data directory')
+    parser.add_argument('--val-dir', type=str, default=None,
+                       help='Path to separate validation directory (optional)')
     parser.add_argument('--output-dir', type=str, default='models_curriculum',
                        help='Directory to save models')
     parser.add_argument('--skip-stages', type=str, default='',
                        help='Comma-separated stage numbers to skip (e.g., "1,2")')
     parser.add_argument('--use-curriculum', action='store_false', default=True,
                        help='Disable curriculum learning in stage 3')
-    parser.add_argument('--base-model-path', type=str, default='car_damage_model.keras',
-                       help='Path to pretrained model to continue training from')
+
 
     args = parser.parse_args()
 
@@ -472,21 +468,23 @@ def main(data_dir=None, output_dir='models_curriculum'):
     os.makedirs(output_dir, exist_ok=True)
 
     # Load dataset
-    X, y = load_dataset_from_directory(data_dir)
-    logger.info(f"Loaded {len(X)} images with {len(np.unique(y))} classes")
+    X_train, y_train = load_dataset_from_directory(data_dir)
+    logger.info(f"Loaded {len(X_train)} training images with {len(np.unique(y_train))} classes")
 
-    # Split into train and validation
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
+    if args.val_dir:
+        logger.info(f"Loading validation data from: {args.val_dir}")
+        X_val, y_val = load_dataset_from_directory(args.val_dir)
+        logger.info(f"Loaded {len(X_val)} validation images")
+    else:
+        logger.info("No --val-dir provided, splitting training data 80/20")
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train, y_train, test_size=0.2, stratify=y_train, random_state=42
+        )
 
     # Preprocess all data
     logger.info("Preprocessing images...")
     X_train = preprocess_input(X_train)
     X_val = preprocess_input(X_val)
-
-    # Load initial model for transfer learning
-    initial_model = keras.models.load_model(args.base_model_path)
 
     # Stage 1: Minor vs Non-minor
     stage1_model = None
@@ -497,31 +495,12 @@ def main(data_dir=None, output_dir='models_curriculum'):
     # Stage 2: Severe vs Non-severe
     stage2_model = None
     if '2' not in args.skip_stages.split(','):
-        stage2_model, _ = train_stage2(X_train, y_train, X_val, y_val,
-                                       stage1_weights_path=os.path.join(output_dir, 'stage1_minor_vs_nonminor.keras'))
+        stage2_model, _ = train_stage2(X_train, y_train, X_val, y_val)
         stage2_model.save(os.path.join(output_dir, 'stage2_severe_vs_nonsevere.keras'))
 
-    # Stage 3: Full 3-class with curriculum
-    logger.info("\n" + "=" * 60)
-    logger.info("LOADING INITIAL MODEL FOR STAGE 3")
-    logger.info("=" * 60)
-
-    model = build_model(num_classes=3, freeze_base=False)
-
-    # Load weights from initial model (transfer learning)
-    # Match layers by name
-    for layer in model.layers:
-        try:
-            matched_layer = initial_model.get_layer(name=layer.name)
-            layer.set_weights(matched_layer.get_weights())
-            logger.info(f"Loaded weights for layer: {layer.name}")
-        except:
-            logger.warning(f"Could not load weights for layer: {layer.name}")
-
+    # Stage 3: Full 3-class with curriculum (builds its own model from ImageNet weights)
     final_model = train_stage3(
         X_train, y_train, X_val, y_val,
-        stage1_model=stage1_model,
-        stage2_model=stage2_model,
         use_curriculum=args.use_curriculum
     )
 

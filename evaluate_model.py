@@ -33,7 +33,10 @@ def load_dataset_from_directory(data_dir):
     labels = []
     filenames = []
 
-    class_names = sorted(os.listdir(data_dir))
+    class_names = sorted(
+        d for d in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, d)) and not d.startswith('.')
+    )
     logger.info(f"Found classes: {class_names}")
 
     for class_idx, class_name in enumerate(class_names):

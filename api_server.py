@@ -17,6 +17,8 @@ from tensorflow.keras.applications.efficientnet import preprocess_input
 from PIL import Image
 import cv2
 
+from hard_example_miner import HardExampleMiner
+
 # Configuration
 REGISTRY_PATH = "model_registry.json"
 IMG_SIZE = 224
@@ -24,6 +26,14 @@ CONFIDENCE_THRESHOLD = 0.6
 GRADCAM_LAYER = "top_conv"  # Last conv layer inside EfficientNet-B0
 
 app = FastAPI(title="Car Damage Severity API")
+
+# Hard example mining — logs uncertain/wrong predictions for targeted retraining
+miner = HardExampleMiner(
+    db_path="hard_examples.db",
+    image_store_dir="hard_examples/images",
+    uncertainty_threshold=0.5,
+    confidence_threshold=0.7,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -417,15 +427,27 @@ async def predict(
     inference_time = (time.time() - start_time) * 1000
 
     result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
+    used_version = version or registry.active_version
+    entropy = round(predictive_entropy(probabilities), 4)
+
+    miner.log_prediction(
+        image_bytes=image_bytes,
+        filename=file.filename,
+        model_version=used_version,
+        probabilities=probabilities,
+        class_names=artifacts["class_names"],
+        source="api",
+    )
+
     response = {
-        "model_version": version or registry.active_version,
+        "model_version": used_version,
         "prediction": result["prediction"],
         "confidence": result["confidence"],
         "all_probabilities": result["all_probabilities"],
         "inference_time_ms": round(inference_time, 2),
     }
     if uncertainty:
-        response["uncertainty"] = round(predictive_entropy(probabilities), 4)
+        response["uncertainty"] = entropy
     if heatmap:
         cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)
         response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
@@ -455,9 +477,21 @@ async def predict_batch(
     all_probs = list(artifacts["model"].predict(batch, verbose=0))
     total_inference_time = (time.time() - start_time) * 1000
 
+    used_version = version or registry.active_version
     results = []
     for i, probabilities in enumerate(all_probs):
         result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
+        entropy = round(predictive_entropy(probabilities), 4)
+
+        miner.log_prediction(
+            image_bytes=images_bytes[i],
+            filename=files[i].filename,
+            model_version=used_version,
+            probabilities=probabilities,
+            class_names=artifacts["class_names"],
+            source="api_batch",
+        )
+
         item = {
             "filename": files[i].filename,
             "prediction": result["prediction"],
@@ -465,7 +499,7 @@ async def predict_batch(
             "all_probabilities": result["all_probabilities"],
         }
         if uncertainty:
-            item["uncertainty"] = round(predictive_entropy(probabilities), 4)
+            item["uncertainty"] = entropy
         if heatmap:
             img_array = np.expand_dims(batch[i], axis=0)
             cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)
@@ -473,7 +507,7 @@ async def predict_batch(
         results.append(item)
 
     return {
-        "model_version": version or registry.active_version,
+        "model_version": used_version,
         "results": results,
         "total_images": len(files),
         "total_inference_time_ms": round(total_inference_time, 2),
@@ -550,6 +584,67 @@ async def predict_ensemble(
         response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Hard example mining endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/hard-examples/stats")
+async def hard_example_stats():
+    """Summary statistics for logged hard examples."""
+    return miner.get_stats()
+
+
+@app.get("/hard-examples")
+async def list_hard_examples(
+    min_uncertainty: float = Query(None, description="Minimum uncertainty score [0, 1]"),
+    max_confidence: float = Query(None, description="Maximum confidence score [0, 1]"),
+    only_wrong: bool = Query(False, description="Only return misclassified examples"),
+    class_filter: str = Query(None, description="Filter by predicted or true label, e.g. '02-moderate'"),
+    limit: int = Query(100, description="Maximum number of results"),
+):
+    """List hard examples, sorted by difficulty score descending."""
+    return miner.get_hard_examples(
+        min_uncertainty=min_uncertainty,
+        max_confidence=max_confidence,
+        only_wrong=only_wrong,
+        class_filter=class_filter,
+        limit=limit,
+    )
+
+
+@app.post("/hard-examples/{example_id}/label")
+async def label_hard_example(
+    example_id: str,
+    true_label: str = Body(..., description="Ground-truth class label, e.g. '02-moderate'"),
+):
+    """Add or update the ground-truth label for a logged example."""
+    if not miner.label_example(example_id, true_label):
+        raise HTTPException(status_code=404, detail=f"Example not found: {example_id}")
+    return {"labeled": example_id, "true_label": true_label}
+
+
+@app.post("/hard-examples/export")
+async def export_hard_examples(
+    output_dir: str = Query("hard_examples/dataset", description="Root directory for exported dataset"),
+    strategy: str = Query(
+        "uncertainty",
+        description="Export strategy: 'uncertainty' | 'wrong' | 'hard' | 'all'",
+    ),
+    threshold: float = Query(None, description="Uncertainty threshold (defaults to miner setting)"),
+    only_labeled: bool = Query(False, description="Only export examples with a confirmed true label"),
+):
+    """
+    Export hard examples into a labelled directory structure for retraining.
+
+    The output mirrors the layout expected by train_curriculum.py:
+        output_dir/01-minor/...
+        output_dir/02-moderate/...
+        output_dir/03-severe/...
+    """
+    result = miner.export_dataset(output_dir, strategy, threshold, only_labeled)
+    return result
 
 
 if __name__ == "__main__":

@@ -6,3 +6,5 @@ __pycache__/
 CLAUDE.md
 data3a/
 .claude/
+hard_examples.db
+hard_examples/

@@ -23,6 +23,8 @@ import argparse
 import logging
 from pathlib import Path
 
+from hard_example_miner import HardExampleMiner
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,8 @@ def preprocess_input(img_array):
     return preprocess_input(img_array.copy())
 
 
-def evaluate_model(model_path, data_dir, output_dir=None, batch_size=32):
+def evaluate_model(model_path, data_dir, output_dir=None, batch_size=32,
+                   mine_hard_examples=False, hard_examples_db="hard_examples.db"):
     """Evaluate a trained model on test data."""
 
     # Load model
@@ -167,6 +170,36 @@ def evaluate_model(model_path, data_dir, output_dir=None, batch_size=32):
             json.dump(metrics, f, indent=2)
 
         logger.info(f"\nResults saved to: {output_dir}")
+
+    if mine_hard_examples:
+        model_version = Path(model_path).stem
+        miner = HardExampleMiner(
+            db_path=hard_examples_db,
+            image_store_dir=str(Path(hard_examples_db).parent / "hard_examples" / "images"),
+        )
+        logger.info("\nMining hard examples from evaluation set...")
+        mined_count = 0
+        for i, filepath in enumerate(filenames):
+            with open(filepath, "rb") as f:
+                image_bytes = f.read()
+            true_label = class_names[int(y_test[i])]
+            example_id = miner.log_prediction(
+                image_bytes=image_bytes,
+                filename=filepath,
+                model_version=model_version,
+                probabilities=y_pred_proba[i],
+                class_names=class_names,
+                true_label=true_label,
+                source="evaluation",
+            )
+            mined_count += 1
+
+        stats = miner.get_stats()
+        logger.info(f"Logged {mined_count} samples. Hard examples: {stats['hard_examples']} "
+                    f"| Wrong predictions: {stats['wrong_predictions']}")
+        if output_dir:
+            with open(os.path.join(output_dir, "hard_examples_stats.json"), "w") as f:
+                json.dump(stats, f, indent=2)
 
     return {
         'accuracy': accuracy,
@@ -287,6 +320,10 @@ def main():
                        help='Additional model paths to compare')
     parser.add_argument('--predict', type=str,
                        help='Path to single image for prediction')
+    parser.add_argument('--mine-hard-examples', action='store_true',
+                       help='Log uncertain/wrong predictions to the hard examples database')
+    parser.add_argument('--hard-examples-db', type=str, default='hard_examples.db',
+                       help='Path to the hard examples SQLite database')
 
     args = parser.parse_args()
 
@@ -299,7 +336,11 @@ def main():
         compare_models(model_paths, args.data_dir, args.output_dir)
     else:
         # Single model evaluation
-        evaluate_model(args.model, args.data_dir, args.output_dir)
+        evaluate_model(
+            args.model, args.data_dir, args.output_dir,
+            mine_hard_examples=args.mine_hard_examples,
+            hard_examples_db=args.hard_examples_db,
+        )
 
 
 if __name__ == '__main__':

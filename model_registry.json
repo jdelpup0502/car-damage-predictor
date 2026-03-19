@@ -1,0 +1,11 @@
+{
+  "active": "v1",
+  "versions": {
+    "v1": {
+      "path": "car_damage_model.keras",
+      "class_mapping": "class_mapping.json",
+      "description": "Base EfficientNet-B0 model",
+      "registered_at": "2026-03-19T00:16:38.060752+00:00"
+    }
+  }
+}

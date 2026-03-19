@@ -5,6 +5,7 @@ import base64
 import numpy as np
 
 from fastapi import FastAPI, UploadFile, File, Query
+from typing import List
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -149,6 +150,51 @@ async def predict(
         response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
 
     return response
+
+
+@app.post("/predict/batch")
+async def predict_batch(
+    files: List[UploadFile] = File(...),
+    heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay for each image")
+):
+    images_bytes = [await f.read() for f in files]
+
+    # Build batch array
+    batch = np.concatenate([preprocess_image(b) for b in images_bytes], axis=0)
+
+    start_time = time.time()
+    predictions = model.predict(batch, verbose=0)
+    total_inference_time = (time.time() - start_time) * 1000
+
+    results = []
+    for i, probabilities in enumerate(predictions):
+        predicted_idx = int(np.argmax(probabilities))
+        confidence = float(probabilities[predicted_idx])
+        uncertain = confidence < CONFIDENCE_THRESHOLD
+
+        result = {
+            "filename": files[i].filename,
+            "prediction": "uncertain" if uncertain else class_names[predicted_idx],
+            "confidence": round(confidence, 4),
+            "all_probabilities": {
+                class_names[j]: round(float(probabilities[j]), 4)
+                for j in range(len(class_names))
+            },
+        }
+
+        if heatmap:
+            img_array = np.expand_dims(batch[i], axis=0)
+            cam = compute_gradcam(img_array, predicted_idx)
+            result["heatmap_png_base64"] = overlay_heatmap(images_bytes[i], cam)
+
+        results.append(result)
+
+    return {
+        "results": results,
+        "total_images": len(files),
+        "total_inference_time_ms": round(total_inference_time, 2),
+        "avg_inference_time_ms": round(total_inference_time / len(files), 2),
+    }
 
 
 if __name__ == "__main__":

@@ -12,6 +12,12 @@
       "class_mapping": "class_mapping.json",
       "description": "Copy of v1 for ensemble demo",
       "registered_at": "2026-03-19T00:35:40.996983+00:00"
+    },
+    "v2-curriculum": {
+      "path": "models_curriculum/final_curriculum_model.keras",
+      "class_mapping": "models_curriculum/class_mapping.json",
+      "description": "Curriculum-trained EfficientNet-B0 (3-stage)",
+      "registered_at": "2026-03-19T00:38:41.904163+00:00"
     }
   },
   "ensembles": {
@@ -26,6 +32,18 @@
       ],
       "description": "Production ensemble",
       "created_at": "2026-03-19T00:35:41.105353+00:00"
+    },
+    "real-ensemble": {
+      "versions": [
+        "v1",
+        "v2-curriculum"
+      ],
+      "weights": [
+        0.5,
+        0.5
+      ],
+      "description": "Base model + curriculum model ensemble",
+      "created_at": "2026-03-19T00:38:49.284292+00:00"
     }
   }
 }

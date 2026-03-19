@@ -1,5 +1,8 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .DS_Store
 CLAUDE.md
+data3a/
+.claude/

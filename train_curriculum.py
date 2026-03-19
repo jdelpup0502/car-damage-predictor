@@ -76,6 +76,21 @@ def preprocess_input(img_array):
     return preprocess_input(img_array.copy())
 
 
+# Augmentation pipeline applied during training only
+_augmentation = keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.1),
+    layers.RandomZoom(0.1),
+    layers.RandomBrightness(0.2),
+    layers.RandomContrast(0.2),
+], name="augmentation")
+
+
+def augment_batch(X_batch):
+    """Apply random augmentations to a batch (numpy array → numpy array)."""
+    return _augmentation(tf.constant(X_batch), training=True).numpy()
+
+
 def build_model(num_classes=3, freeze_base=True):
     """Build the EfficientNet-B0 model for severity classification."""
     base_model = EfficientNetB0(
@@ -336,7 +351,7 @@ def train_stage3(X_train, y_train, X_val, y_val,
                 batch_indices = self.indices_to_use[idx * self.batch_size:(idx + 1) * self.batch_size]
                 batch_indices = np.array(batch_indices)
 
-                X_batch = self.X[batch_indices]
+                X_batch = augment_batch(self.X[batch_indices])
                 y_batch = keras.utils.to_categorical(self.y[batch_indices], num_classes=3)
 
                 return X_batch, y_batch
@@ -389,11 +404,24 @@ def train_stage3(X_train, y_train, X_val, y_val,
         y_train_cat = keras.utils.to_categorical(y_train, num_classes=3)
         y_val_cat = keras.utils.to_categorical(y_val, num_classes=3)
 
+        train_ds = (
+            tf.data.Dataset.from_tensor_slices((X_train, y_train_cat))
+            .shuffle(len(X_train))
+            .batch(BATCH_SIZE)
+            .map(lambda x, y: (_augmentation(x, training=True), y),
+                 num_parallel_calls=tf.data.AUTOTUNE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+        val_ds = (
+            tf.data.Dataset.from_tensor_slices((X_val, y_val_cat))
+            .batch(BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
         history = model.fit(
-            X_train, y_train_cat,
-            validation_data=(X_val, y_val_cat),
+            train_ds,
+            validation_data=val_ds,
             epochs=EPOCHS_STAGE3,
-            batch_size=BATCH_SIZE,
             class_weight=class_weights,
             callbacks=callbacks,
             verbose=1

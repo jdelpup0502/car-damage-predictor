@@ -6,8 +6,8 @@ import os
 import numpy as np
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException
-from typing import List
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Body
+from typing import List, Optional
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -31,12 +31,12 @@ app = FastAPI(title="Car Damage Severity API")
 # ---------------------------------------------------------------------------
 
 class ModelRegistry:
-    """Manages multiple model versions and the currently active one."""
+    """Manages multiple model versions, ensembles, and the currently active version."""
 
     def __init__(self, registry_path: str):
         self.registry_path = registry_path
-        self._loaded: dict = {}      # version -> {"model", "eff_grad_model", "post_eff_layers", "class_names"}
-        self._meta: dict = {}        # persisted registry JSON
+        self._loaded: dict = {}   # version -> {"model", "eff_grad_model", "post_eff_layers", "class_names"}
+        self._meta: dict = {}
         self.active_version: str = None
 
     # -- Persistence ---------------------------------------------------------
@@ -45,7 +45,7 @@ class ModelRegistry:
         if os.path.exists(self.registry_path):
             with open(self.registry_path) as f:
                 return json.load(f)
-        return {"active": None, "versions": {}}
+        return {"active": None, "versions": {}, "ensembles": {}}
 
     def _write(self, data: dict):
         with open(self.registry_path, "w") as f:
@@ -77,10 +77,19 @@ class ModelRegistry:
             "class_names": class_names,
         }
 
-    # -- Public API ----------------------------------------------------------
+    def _ensure_loaded(self, version: str):
+        """Load a version into memory if not already loaded."""
+        if version not in self._loaded:
+            self._meta = self._read()
+            if version not in self._meta["versions"]:
+                raise KeyError(f"Unknown version: {version}")
+            print(f"Loading model version '{version}'...")
+            self._loaded[version] = self._load_model_artifacts(version)
+            print(f"Version '{version}' loaded. Classes: {self._loaded[version]['class_names']}")
+
+    # -- Version management --------------------------------------------------
 
     def startup(self):
-        """Load registry and activate the stored active version."""
         self._meta = self._read()
         if not self._meta["versions"]:
             raise RuntimeError("model_registry.json has no registered versions.")
@@ -92,7 +101,6 @@ class ModelRegistry:
         self.activate(active)
 
     def register(self, version: str, path: str, class_mapping: str, description: str = ""):
-        """Add a new version to the registry (does not activate it)."""
         self._meta = self._read()
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model file not found: {path}")
@@ -109,49 +117,96 @@ class ModelRegistry:
         self._write(self._meta)
 
     def activate(self, version: str):
-        """Switch the active version, loading it into memory if needed."""
         self._meta = self._read()
         if version not in self._meta["versions"]:
             raise KeyError(f"Unknown version: {version}")
-        if version not in self._loaded:
-            print(f"Loading model version '{version}'...")
-            self._loaded[version] = self._load_model_artifacts(version)
-            print(f"Version '{version}' loaded. Classes: {self._loaded[version]['class_names']}")
+        self._ensure_loaded(version)
         self.active_version = version
         self._meta["active"] = version
         self._write(self._meta)
 
     def get_active(self) -> dict:
-        """Return artifacts for the currently active version."""
         return self._loaded[self.active_version]
+
+    def get_version(self, version: str) -> dict:
+        self._ensure_loaded(version)
+        return self._loaded[version]
 
     def list_versions(self) -> list:
         self._meta = self._read()
-        result = []
-        for v, info in self._meta["versions"].items():
-            result.append({
+        return [
+            {
                 "version": v,
                 "active": v == self.active_version,
                 "loaded": v in self._loaded,
                 "path": info["path"],
                 "description": info.get("description", ""),
                 "registered_at": info.get("registered_at", ""),
-            })
-        return result
+            }
+            for v, info in self._meta["versions"].items()
+        ]
+
+    # -- Ensemble management -------------------------------------------------
+
+    def register_ensemble(self, name: str, versions: list, weights: list = None, description: str = ""):
+        """Define a named ensemble. Weights are normalised to sum to 1."""
+        self._meta = self._read()
+        for v in versions:
+            if v not in self._meta["versions"]:
+                raise KeyError(f"Unknown version '{v}' — register it first.")
+        if weights is None:
+            weights = [1.0 / len(versions)] * len(versions)
+        if len(weights) != len(versions):
+            raise ValueError("len(weights) must equal len(versions)")
+        total = sum(weights)
+        weights = [w / total for w in weights]  # normalise
+        self._meta.setdefault("ensembles", {})[name] = {
+            "versions": versions,
+            "weights": weights,
+            "description": description,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._write(self._meta)
+
+    def delete_ensemble(self, name: str):
+        self._meta = self._read()
+        if name not in self._meta.get("ensembles", {}):
+            raise KeyError(f"Unknown ensemble: {name}")
+        del self._meta["ensembles"][name]
+        self._write(self._meta)
+
+    def list_ensembles(self) -> list:
+        self._meta = self._read()
+        return [
+            {"name": n, **info}
+            for n, info in self._meta.get("ensembles", {}).items()
+        ]
+
+    def get_ensemble_members(self, name: str) -> list:
+        """Return list of (artifacts, weight) for a named ensemble, loading models as needed."""
+        self._meta = self._read()
+        ensembles = self._meta.get("ensembles", {})
+        if name not in ensembles:
+            raise KeyError(f"Unknown ensemble: {name}")
+        info = ensembles[name]
+        members = []
+        for version, weight in zip(info["versions"], info["weights"]):
+            self._ensure_loaded(version)
+            members.append((self._loaded[version], weight))
+        return members
 
 
 registry = ModelRegistry(REGISTRY_PATH)
 
 
 # ---------------------------------------------------------------------------
-# Startup — seed registry from legacy MODEL_PATH if needed
+# Startup
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup():
     data = registry._read()
     if not data["versions"]:
-        # First run: register the existing model as v1
         registry._meta = data
         registry._write(data)
         registry.register(
@@ -219,16 +274,10 @@ def overlay_heatmap(image_bytes, heatmap, alpha=0.4):
 
 
 def predictive_entropy(probabilities: np.ndarray) -> float:
-    """Normalised predictive entropy as uncertainty estimate.
-
-    Returns a value in [0, 1]:
-      0 = perfectly confident (one class has prob 1.0)
-      1 = maximally uncertain (uniform distribution)
-    """
+    """Normalised predictive entropy [0, 1]. 0 = certain, 1 = maximally uncertain."""
     num_classes = len(probabilities)
     p = np.clip(probabilities, 1e-10, 1.0)
-    entropy = -np.sum(p * np.log(p))
-    return float(entropy / np.log(num_classes))
+    return float(-np.sum(p * np.log(p)) / np.log(num_classes))
 
 
 def build_result(probabilities, class_names, confidence_threshold):
@@ -245,14 +294,46 @@ def build_result(probabilities, class_names, confidence_threshold):
     }
 
 
+def ensemble_predict(img_array: np.ndarray, members: list) -> tuple:
+    """Run inference across ensemble members and return weighted-average probabilities.
+
+    Args:
+        img_array: preprocessed image array (1, H, W, C)
+        members: list of (artifacts, weight) tuples
+
+    Returns:
+        avg_probs       — (num_classes,) weighted average probabilities
+        per_model       — list of {"version": ..., "weight": ..., "probabilities": {...}}
+    """
+    class_names = members[0][0]["class_names"]
+    weighted_sum = np.zeros(len(class_names))
+    per_model = []
+
+    for artifacts, weight in members:
+        probs = artifacts["model"].predict(img_array, verbose=0)[0]
+        weighted_sum += weight * probs
+        per_model.append({
+            "weight": round(weight, 4),
+            "probabilities": {
+                class_names[i]: round(float(probs[i]), 4)
+                for i in range(len(class_names))
+            },
+        })
+
+    return weighted_sum, per_model
+
+
 # ---------------------------------------------------------------------------
 # Model management endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/models")
 async def list_models():
-    """List all registered model versions."""
-    return {"versions": registry.list_versions()}
+    """List all registered model versions and ensembles."""
+    return {
+        "versions": registry.list_versions(),
+        "ensembles": registry.list_ensembles(),
+    }
 
 
 @app.post("/models/register")
@@ -284,6 +365,31 @@ async def activate_model(version: str):
     return {"active": registry.active_version, "versions": registry.list_versions()}
 
 
+@app.post("/models/ensembles/{name}")
+async def create_ensemble(
+    name: str,
+    versions: List[str] = Body(..., description="List of version names to include"),
+    weights: Optional[List[float]] = Body(None, description="Per-version weights (normalised automatically). Defaults to equal weights."),
+    description: str = Body("", description="Optional description"),
+):
+    """Create or update a named ensemble."""
+    try:
+        registry.register_ensemble(name, versions, weights, description)
+    except (KeyError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ensemble": name, "ensembles": registry.list_ensembles()}
+
+
+@app.delete("/models/ensembles/{name}")
+async def delete_ensemble(name: str):
+    """Remove a named ensemble (does not unload or delete model files)."""
+    try:
+        registry.delete_ensemble(name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"deleted": name, "ensembles": registry.list_ensembles()}
+
+
 # ---------------------------------------------------------------------------
 # Prediction endpoints
 # ---------------------------------------------------------------------------
@@ -292,12 +398,12 @@ async def activate_model(version: str):
 async def predict(
     file: UploadFile = File(...),
     heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay in response"),
-    uncertainty: bool = Query(False, description="Run MC dropout to estimate prediction uncertainty"),
+    uncertainty: bool = Query(False, description="Include predictive entropy as uncertainty score"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
 ):
     if version:
         try:
-            artifacts = registry._loaded.get(version) or registry._load_model_artifacts(version)
+            artifacts = registry.get_version(version)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Unknown version: {version}")
     else:
@@ -320,7 +426,6 @@ async def predict(
     }
     if uncertainty:
         response["uncertainty"] = round(predictive_entropy(probabilities), 4)
-
     if heatmap:
         cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)
         response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
@@ -332,12 +437,12 @@ async def predict(
 async def predict_batch(
     files: List[UploadFile] = File(...),
     heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay for each image"),
-    uncertainty: bool = Query(False, description="Run MC dropout to estimate prediction uncertainty"),
+    uncertainty: bool = Query(False, description="Include predictive entropy as uncertainty score"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
 ):
     if version:
         try:
-            artifacts = registry._loaded.get(version) or registry._load_model_artifacts(version)
+            artifacts = registry.get_version(version)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Unknown version: {version}")
     else:
@@ -374,6 +479,77 @@ async def predict_batch(
         "total_inference_time_ms": round(total_inference_time, 2),
         "avg_inference_time_ms": round(total_inference_time / len(files), 2),
     }
+
+
+@app.post("/predict/ensemble")
+async def predict_ensemble(
+    file: UploadFile = File(...),
+    ensemble: str = Query(None, description="Named ensemble to use"),
+    versions: str = Query(None, description="Ad-hoc comma-separated versions, e.g. 'v1,v2'"),
+    weights: str = Query(None, description="Ad-hoc comma-separated weights matching versions, e.g. '0.6,0.4'"),
+    uncertainty: bool = Query(False, description="Include predictive entropy of ensemble output"),
+    heatmap: bool = Query(False, description="Include Grad-CAM from the first ensemble member"),
+):
+    """Predict using a named ensemble or an ad-hoc list of versions."""
+    if ensemble and versions:
+        raise HTTPException(status_code=400, detail="Specify either 'ensemble' or 'versions', not both.")
+    if not ensemble and not versions:
+        raise HTTPException(status_code=400, detail="Specify 'ensemble' (named) or 'versions' (ad-hoc).")
+
+    try:
+        if ensemble:
+            members = registry.get_ensemble_members(ensemble)
+            ensemble_label = ensemble
+        else:
+            version_list = [v.strip() for v in versions.split(",")]
+            weight_list = (
+                [float(w.strip()) for w in weights.split(",")]
+                if weights else None
+            )
+            if weight_list and len(weight_list) != len(version_list):
+                raise HTTPException(status_code=400, detail="len(weights) must equal len(versions)")
+            if weight_list is None:
+                weight_list = [1.0 / len(version_list)] * len(version_list)
+            total = sum(weight_list)
+            weight_list = [w / total for w in weight_list]
+            members = [(registry.get_version(v), w) for v, w in zip(version_list, weight_list)]
+            ensemble_label = f"ad-hoc:[{versions}]"
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    image_bytes = await file.read()
+    img_array = preprocess_image(image_bytes)
+
+    start_time = time.time()
+    avg_probs, per_model = ensemble_predict(img_array, members)
+    inference_time = (time.time() - start_time) * 1000
+
+    # Attach version names to per-model breakdown
+    version_names = (
+        registry._meta.get("ensembles", {}).get(ensemble, {}).get("versions", [])
+        if ensemble
+        else [v.strip() for v in versions.split(",")]
+    )
+    for i, entry in enumerate(per_model):
+        entry["version"] = version_names[i] if i < len(version_names) else f"model_{i}"
+
+    class_names = members[0][0]["class_names"]
+    result = build_result(avg_probs, class_names, CONFIDENCE_THRESHOLD)
+    response = {
+        "ensemble": ensemble_label,
+        "prediction": result["prediction"],
+        "confidence": result["confidence"],
+        "all_probabilities": result["all_probabilities"],
+        "per_model": per_model,
+        "inference_time_ms": round(inference_time, 2),
+    }
+    if uncertainty:
+        response["uncertainty"] = round(predictive_entropy(avg_probs), 4)
+    if heatmap:
+        cam = compute_gradcam(img_array, result["predicted_idx"], members[0][0])
+        response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
+
+    return response
 
 
 if __name__ == "__main__":

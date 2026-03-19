@@ -218,6 +218,19 @@ def overlay_heatmap(image_bytes, heatmap, alpha=0.4):
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def predictive_entropy(probabilities: np.ndarray) -> float:
+    """Normalised predictive entropy as uncertainty estimate.
+
+    Returns a value in [0, 1]:
+      0 = perfectly confident (one class has prob 1.0)
+      1 = maximally uncertain (uniform distribution)
+    """
+    num_classes = len(probabilities)
+    p = np.clip(probabilities, 1e-10, 1.0)
+    entropy = -np.sum(p * np.log(p))
+    return float(entropy / np.log(num_classes))
+
+
 def build_result(probabilities, class_names, confidence_threshold):
     predicted_idx = int(np.argmax(probabilities))
     confidence = float(probabilities[predicted_idx])
@@ -279,6 +292,7 @@ async def activate_model(version: str):
 async def predict(
     file: UploadFile = File(...),
     heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay in response"),
+    uncertainty: bool = Query(False, description="Run MC dropout to estimate prediction uncertainty"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
 ):
     if version:
@@ -293,10 +307,10 @@ async def predict(
     img_array = preprocess_image(image_bytes)
 
     start_time = time.time()
-    predictions = artifacts["model"].predict(img_array, verbose=0)
+    probabilities = artifacts["model"].predict(img_array, verbose=0)[0]
     inference_time = (time.time() - start_time) * 1000
 
-    result = build_result(predictions[0], artifacts["class_names"], CONFIDENCE_THRESHOLD)
+    result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
     response = {
         "model_version": version or registry.active_version,
         "prediction": result["prediction"],
@@ -304,6 +318,8 @@ async def predict(
         "all_probabilities": result["all_probabilities"],
         "inference_time_ms": round(inference_time, 2),
     }
+    if uncertainty:
+        response["uncertainty"] = round(predictive_entropy(probabilities), 4)
 
     if heatmap:
         cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)
@@ -316,6 +332,7 @@ async def predict(
 async def predict_batch(
     files: List[UploadFile] = File(...),
     heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay for each image"),
+    uncertainty: bool = Query(False, description="Run MC dropout to estimate prediction uncertainty"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
 ):
     if version:
@@ -330,11 +347,11 @@ async def predict_batch(
     batch = np.concatenate([preprocess_image(b) for b in images_bytes], axis=0)
 
     start_time = time.time()
-    predictions = artifacts["model"].predict(batch, verbose=0)
+    all_probs = list(artifacts["model"].predict(batch, verbose=0))
     total_inference_time = (time.time() - start_time) * 1000
 
     results = []
-    for i, probabilities in enumerate(predictions):
+    for i, probabilities in enumerate(all_probs):
         result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
         item = {
             "filename": files[i].filename,
@@ -342,6 +359,8 @@ async def predict_batch(
             "confidence": result["confidence"],
             "all_probabilities": result["all_probabilities"],
         }
+        if uncertainty:
+            item["uncertainty"] = round(predictive_entropy(probabilities), 4)
         if heatmap:
             img_array = np.expand_dims(batch[i], axis=0)
             cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)

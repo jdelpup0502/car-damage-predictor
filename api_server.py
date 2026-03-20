@@ -14,7 +14,7 @@ import uvicorn
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.applications.efficientnet import preprocess_input
-from PIL import Image
+from PIL import Image, ImageEnhance
 import cv2
 
 from hard_example_miner import HardExampleMiner
@@ -242,6 +242,31 @@ def preprocess_image(image_bytes):
     return img_array
 
 
+def tta_predict(image_bytes: bytes, artifacts: dict, n_augments: int = 8) -> np.ndarray:
+    """Run inference on multiple augmented versions and return averaged probabilities.
+
+    Augmentations: original, horizontal flip, brightness ±20%, rotations ±10°
+    (and flipped variants of each). Returns mean probabilities across all variants.
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    flipped = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+    variants = [img, flipped]
+    for factor in [0.8, 1.2]:
+        variants.append(ImageEnhance.Brightness(img).enhance(factor))
+        variants.append(ImageEnhance.Brightness(flipped).enhance(factor))
+    for angle in [10, -10]:
+        variants.append(img.rotate(angle))
+        variants.append(flipped.rotate(angle))
+
+    variants = variants[:n_augments]
+    batch = np.stack([np.array(v, dtype=np.float32) for v in variants], axis=0)
+    batch = preprocess_input(batch)
+
+    all_probs = artifacts["model"].predict(batch, verbose=0)
+    return np.mean(all_probs, axis=0)
+
+
 def compute_gradcam(img_array, class_idx, artifacts: dict):
     eff_grad_model = artifacts["eff_grad_model"]
     post_eff_layers = artifacts["post_eff_layers"]
@@ -410,6 +435,7 @@ async def predict(
     heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay in response"),
     uncertainty: bool = Query(False, description="Include predictive entropy as uncertainty score"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
+    tta: bool = Query(False, description="Use test-time augmentation (8 augmented views averaged)"),
 ):
     if version:
         try:
@@ -420,10 +446,13 @@ async def predict(
         artifacts = registry.get_active()
 
     image_bytes = await file.read()
-    img_array = preprocess_image(image_bytes)
 
     start_time = time.time()
-    probabilities = artifacts["model"].predict(img_array, verbose=0)[0]
+    if tta:
+        probabilities = tta_predict(image_bytes, artifacts)
+    else:
+        img_array = preprocess_image(image_bytes)
+        probabilities = artifacts["model"].predict(img_array, verbose=0)[0]
     inference_time = (time.time() - start_time) * 1000
 
     result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
@@ -449,8 +478,11 @@ async def predict(
     if uncertainty:
         response["uncertainty"] = entropy
     if heatmap:
-        cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)
+        plain_array = preprocess_image(image_bytes)
+        cam = compute_gradcam(plain_array, result["predicted_idx"], artifacts)
         response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
+    if tta:
+        response["tta"] = True
 
     return response
 

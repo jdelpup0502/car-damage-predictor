@@ -225,6 +225,30 @@ curl -X POST "http://localhost:8000/hard-examples/<id>/label" \
 curl -X POST "http://localhost:8000/hard-examples/export?strategy=uncertainty&output_dir=hard_examples/dataset"
 ```
 
+### A/B Testing
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/experiments` | Create and activate an A/B experiment |
+| `GET` | `/experiments` | List all experiments |
+| `POST` | `/experiments/{name}/stop` | Stop a running experiment |
+| `GET` | `/experiments/{name}/metrics` | Per-variant metrics (requests, confidence, accuracy) |
+
+```bash
+# Start an experiment — 50/50 split between base and curriculum model
+curl -X POST http://localhost:8000/experiments \
+  -H "Content-Type: application/json" \
+  -d '{"name":"curriculum-vs-base","variants":[{"version":"v1","weight":0.5},{"version":"v2-curriculum","weight":0.5}],"description":"Compare base vs curriculum"}'
+
+# Check per-variant metrics
+curl http://localhost:8000/experiments/curriculum-vs-base/metrics
+
+# Stop the experiment
+curl -X POST http://localhost:8000/experiments/curriculum-vs-base/stop
+```
+
+While an experiment is active, `/predict` randomly routes traffic between variants (weighted). Passing `?version=v1` always bypasses A/B. Experiment name and variant appear in the response and are logged to SQLite for metric tracking.
+
 ---
 
 ## Features
@@ -236,9 +260,10 @@ curl -X POST "http://localhost:8000/hard-examples/export?strategy=uncertainty&ou
 | **Grad-CAM heatmaps** | Visualise which image regions drove the prediction |
 | **Test-time augmentation** | Average 8 augmented views for more robust predictions |
 | **Hard example mining** | Auto-log uncertain/wrong predictions to SQLite for targeted retraining |
+| **Model A/B testing** | Weighted traffic splitting across model versions with per-variant metrics |
 | **Model hot-swap** | Switch active model version without restarting the server |
 | **Curriculum learning** | Multi-stage training strategy to improve the ambiguous moderate class |
-| **Web frontend** | Next.js drag-and-drop UI with probability bars and heatmap viewer |
+| **Web frontend** | Next.js drag-and-drop UI with probability bars, heatmap viewer, and A/B indicator |
 
 ---
 

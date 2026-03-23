@@ -61,7 +61,17 @@ export default function Home() {
               <p className="text-sm text-blue-600 mt-3 animate-pulse">Analyzing image...</p>
             )}
             {error && (
-              <p className="text-sm text-red-600 mt-3">Error: {error}</p>
+              error === "not_a_vehicle" ? (
+                <div className="mt-3 flex items-start gap-2 rounded-lg bg-amber-50 border border-amber-200 px-4 py-3">
+                  <span className="text-amber-500 text-lg leading-none">⚠</span>
+                  <div>
+                    <p className="text-sm font-medium text-amber-800">Not a vehicle</p>
+                    <p className="text-sm text-amber-700">Please upload a photo of a car.</p>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-red-600 mt-3">Error: {error}</p>
+              )
             )}
           </section>
 

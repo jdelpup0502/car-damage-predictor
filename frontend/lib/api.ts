@@ -20,6 +20,12 @@ export async function predict(
   });
 
   if (!res.ok) {
+    if (res.status === 422) {
+      const body = await res.json().catch(() => null);
+      if (body?.detail?.error === "not_a_vehicle") {
+        throw new Error("not_a_vehicle");
+      }
+    }
     const text = await res.text();
     throw new Error(`API error ${res.status}: ${text}`);
   }

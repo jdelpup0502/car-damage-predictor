@@ -19,8 +19,9 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<PredictionResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [currentFile, setCurrentFile] = useState<File | null>(null);
 
-  async function handleFile(file: File) {
+  async function runPrediction(file: File) {
     setLoading(true);
     setError(null);
     setResult(null);
@@ -32,6 +33,15 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function handleFile(file: File) {
+    setCurrentFile(file);
+    runPrediction(file);
+  }
+
+  function handleReanalyze() {
+    if (currentFile) runPrediction(currentFile);
   }
 
   return (
@@ -58,6 +68,15 @@ export default function Home() {
           <section className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
             <h2 className="text-lg font-semibold mb-4">Options</h2>
             <SettingsPanel options={options} onChange={setOptions} />
+            {currentFile && (
+              <button
+                onClick={handleReanalyze}
+                disabled={loading}
+                className="mt-5 w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-sm font-medium rounded-lg transition-colors"
+              >
+                {loading ? "Analyzing..." : "Re-analyze"}
+              </button>
+            )}
           </section>
         </div>
 

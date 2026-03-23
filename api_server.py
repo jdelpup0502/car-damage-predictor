@@ -219,7 +219,7 @@ class ModelRegistry:
 
     # -- A/B experiment management -------------------------------------------
 
-    def get_active_experiment(self) -> dict | None:
+    def get_active_experiment(self) -> Optional[dict]:
         """Return the active experiment dict (with its name), or None."""
         self._meta = self._read()
         for name, exp in self._meta.get("experiments", {}).items():
@@ -267,7 +267,7 @@ class ModelRegistry:
         return {"name": name, **experiments[name]}
 
     def resolve_version_for_request(
-        self, explicit_version: str | None
+        self, explicit_version: Optional[str]
     ) -> tuple:
         """
         Decide which model version to use for this request.

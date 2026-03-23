@@ -8,3 +8,6 @@ data3a/
 .claude/
 hard_examples.db
 hard_examples/
+frontend/node_modules/
+frontend/.next/
+frontend/.env*.local

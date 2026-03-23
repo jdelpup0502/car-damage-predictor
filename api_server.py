@@ -7,6 +7,7 @@ import numpy as np
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -27,10 +28,20 @@ GRADCAM_LAYER = "top_conv"  # Last conv layer inside EfficientNet-B0
 
 app = FastAPI(title="Car Damage Severity API")
 
+# CORS — allow frontend origin(s) set via CORS_ORIGINS env var
+_cors_origins = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _cors_origins],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Hard example mining — logs uncertain/wrong predictions for targeted retraining
 miner = HardExampleMiner(
-    db_path="hard_examples.db",
-    image_store_dir="hard_examples/images",
+    db_path=os.environ.get("HARD_EXAMPLES_DB", "hard_examples.db"),
+    image_store_dir=os.environ.get("HARD_EXAMPLES_IMAGE_DIR", "hard_examples/images"),
     uncertainty_threshold=0.5,
     confidence_threshold=0.7,
 )
@@ -679,5 +690,13 @@ async def export_hard_examples(
     return result
 
 
+@app.get("/health")
+async def health():
+    """Health check endpoint for Railway and other platforms."""
+    return {"status": "ok"}
+
+
 if __name__ == "__main__":
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    is_production = os.environ.get("ENV", "").lower() == "production"
+    uvicorn.run("api_server:app", host="0.0.0.0", port=port, reload=not is_production)

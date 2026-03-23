@@ -1,0 +1,17 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.claude/
+*.md
+data3a/
+eval_results/
+hard_examples*
+train_curriculum.py
+evaluate_model.py
+models_curriculum/stage*.keras
+models_curriculum/*compat*
+frontend/
+examples/
+.idea/

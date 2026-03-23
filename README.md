@@ -180,6 +180,9 @@ Open `http://localhost:3000` to use the drag-and-drop web UI.
 | `uncertainty` | bool | false | Include predictive entropy score [0–1] |
 | `tta` | bool | false | Test-time augmentation (8 views averaged, ~8× slower) |
 | `version` | string | active | Model version to use (`v1`, `v2-curriculum`) |
+| `skip_gate` | bool | false | Bypass the vehicle OOD gate (for testing) |
+
+Non-vehicle images return `HTTP 422` with `{"error": "not_a_vehicle", ...}`. The frontend displays this as a clean amber alert instead of a raw error.
 
 ```bash
 # Prediction with heatmap + uncertainty
@@ -255,6 +258,7 @@ While an experiment is active, `/predict` randomly routes traffic between varian
 
 | Feature | Description |
 |---------|-------------|
+| **Input validation (OOD gate)** | MobileNetV2 vehicle gate rejects non-car images with a 422 before running EfficientNet |
 | **Ensemble inference** | Weighted average across multiple model versions |
 | **Uncertainty estimation** | Predictive entropy — 0 = certain, 1 = maximally uncertain |
 | **Grad-CAM heatmaps** | Visualise which image regions drove the prediction |
@@ -288,6 +292,10 @@ docker run -p 8000:8000 -e CORS_ORIGINS="http://localhost:3000" car-damage-api
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins |
 | `HARD_EXAMPLES_DB` | `hard_examples.db` | SQLite database path |
 | `HARD_EXAMPLES_IMAGE_DIR` | `hard_examples/images` | Saved image directory |
+| `GATE_ENABLED` | `true` | Set to `false` to disable the vehicle OOD gate globally |
+| `GATE_TOP_K` | `10` | Number of top ImageNet classes to inspect |
+| `GATE_MIN_CONF` | `0.10` | Minimum single vehicle-class score to pass |
+| `GATE_SUM_CONF` | `0.15` | Minimum cumulative vehicle-class score to pass |
 
 ### Frontend
 
@@ -315,7 +323,8 @@ Deploy backend first to get its URL, then deploy frontend with that URL, then up
 
 ```
 car-damage-predictor/
-├── api_server.py                        # FastAPI server (prediction, registry, mining)
+├── api_server.py                        # FastAPI server (prediction, registry, mining, A/B)
+├── car_gate.py                          # MobileNetV2 vehicle OOD gate
 ├── hard_example_miner.py                # SQLite-backed uncertain prediction logger
 ├── train_curriculum.py                  # Multi-stage curriculum learning training
 ├── evaluate_model.py                    # Model evaluation and comparison

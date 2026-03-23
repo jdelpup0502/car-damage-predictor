@@ -20,6 +20,7 @@ from PIL import Image, ImageEnhance
 import cv2
 
 from hard_example_miner import HardExampleMiner
+from car_gate import CarGate
 
 # Configuration
 REGISTRY_PATH = "model_registry.json"
@@ -45,6 +46,14 @@ miner = HardExampleMiner(
     image_store_dir=os.environ.get("HARD_EXAMPLES_IMAGE_DIR", "hard_examples/images"),
     uncertainty_threshold=0.5,
     confidence_threshold=0.7,
+)
+
+# Vehicle OOD gate — rejects non-car images before running EfficientNet
+_gate_enabled = os.environ.get("GATE_ENABLED", "true").lower() != "false"
+gate = CarGate(
+    top_k=int(os.environ.get("GATE_TOP_K", "10")),
+    min_vehicle_confidence=float(os.environ.get("GATE_MIN_CONF", "0.10")),
+    sum_vehicle_confidence=float(os.environ.get("GATE_SUM_CONF", "0.15")),
 )
 
 
@@ -310,11 +319,29 @@ async def startup():
             description="Base EfficientNet-B0 model",
         )
     registry.startup()
+    if _gate_enabled:
+        gate._get_model()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _run_gate(image_bytes: bytes, skip: bool) -> None:
+    """Raise HTTPException(422) if the image fails the vehicle gate."""
+    if skip or not _gate_enabled:
+        return
+    is_vehicle, reason = gate.check(image_bytes)
+    if not is_vehicle:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "not_a_vehicle",
+                "message": "Image does not appear to contain a vehicle. Please upload a photo of a car.",
+                "gate_reason": reason,
+            },
+        )
+
 
 def preprocess_image(image_bytes):
     img = Image.open(io.BytesIO(image_bytes))
@@ -520,6 +547,7 @@ async def predict(
     uncertainty: bool = Query(False, description="Include predictive entropy as uncertainty score"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
     tta: bool = Query(False, description="Use test-time augmentation (8 augmented views averaged)"),
+    skip_gate: bool = Query(False, description="Skip vehicle OOD gate (for testing)"),
 ):
     version_str, exp_name, exp_variant = registry.resolve_version_for_request(version)
     try:
@@ -528,6 +556,7 @@ async def predict(
         raise HTTPException(status_code=404, detail=f"Unknown version: {version_str}")
 
     image_bytes = await file.read()
+    _run_gate(image_bytes, skip_gate)
 
     start_time = time.time()
     if tta:
@@ -579,6 +608,7 @@ async def predict_batch(
     heatmap: bool = Query(False, description="Include Grad-CAM heatmap overlay for each image"),
     uncertainty: bool = Query(False, description="Include predictive entropy as uncertainty score"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
+    skip_gate: bool = Query(False, description="Skip vehicle OOD gate (for testing)"),
 ):
     version_str, exp_name, exp_variant = registry.resolve_version_for_request(version)
     try:
@@ -587,20 +617,46 @@ async def predict_batch(
         raise HTTPException(status_code=404, detail=f"Unknown version: {version_str}")
 
     images_bytes = [await f.read() for f in files]
-    batch = np.concatenate([preprocess_image(b) for b in images_bytes], axis=0)
 
-    start_time = time.time()
-    all_probs = list(artifacts["model"].predict(batch, verbose=0))
-    total_inference_time = (time.time() - start_time) * 1000
+    # Per-item gate — collect which images pass
+    gate_results = []
+    valid_indices = []
+    for i, img_bytes in enumerate(images_bytes):
+        if skip_gate or not _gate_enabled:
+            gate_results.append((True, "gate_skipped"))
+            valid_indices.append(i)
+        else:
+            ok, reason = gate.check(img_bytes)
+            gate_results.append((ok, reason))
+            if ok:
+                valid_indices.append(i)
+
+    # Only run inference on images that passed the gate
+    total_inference_time = 0.0
+    inferred: dict = {}
+    if valid_indices:
+        valid_bytes = [images_bytes[i] for i in valid_indices]
+        batch = np.concatenate([preprocess_image(b) for b in valid_bytes], axis=0)
+        start_time = time.time()
+        all_probs = list(artifacts["model"].predict(batch, verbose=0))
+        total_inference_time = (time.time() - start_time) * 1000
+        for seq, idx in enumerate(valid_indices):
+            inferred[idx] = all_probs[seq]
 
     results = []
-    for i, probabilities in enumerate(all_probs):
+    for i, f in enumerate(files):
+        ok, reason = gate_results[i]
+        if not ok:
+            results.append({"filename": f.filename, "rejected": True, "reason": reason})
+            continue
+
+        probabilities = inferred[i]
         result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
         entropy = round(predictive_entropy(probabilities), 4)
 
         miner.log_prediction(
             image_bytes=images_bytes[i],
-            filename=files[i].filename,
+            filename=f.filename,
             model_version=version_str,
             probabilities=probabilities,
             class_names=artifacts["class_names"],
@@ -610,7 +666,8 @@ async def predict_batch(
         )
 
         item = {
-            "filename": files[i].filename,
+            "filename": f.filename,
+            "rejected": False,
             "prediction": result["prediction"],
             "confidence": result["confidence"],
             "all_probabilities": result["all_probabilities"],
@@ -618,17 +675,20 @@ async def predict_batch(
         if uncertainty:
             item["uncertainty"] = entropy
         if heatmap:
-            img_array = np.expand_dims(batch[i], axis=0)
-            cam = compute_gradcam(img_array, result["predicted_idx"], artifacts)
+            plain = preprocess_image(images_bytes[i])
+            cam = compute_gradcam(plain, result["predicted_idx"], artifacts)
             item["heatmap_png_base64"] = overlay_heatmap(images_bytes[i], cam)
         results.append(item)
 
+    accepted = len(valid_indices)
     response = {
         "model_version": version_str,
         "results": results,
         "total_images": len(files),
+        "accepted_images": accepted,
+        "rejected_images": len(files) - accepted,
         "total_inference_time_ms": round(total_inference_time, 2),
-        "avg_inference_time_ms": round(total_inference_time / len(files), 2),
+        "avg_inference_time_ms": round(total_inference_time / accepted, 2) if accepted else 0.0,
     }
     if exp_name:
         response["experiment"] = exp_name
@@ -644,6 +704,7 @@ async def predict_ensemble(
     weights: str = Query(None, description="Ad-hoc comma-separated weights matching versions, e.g. '0.6,0.4'"),
     uncertainty: bool = Query(False, description="Include predictive entropy of ensemble output"),
     heatmap: bool = Query(False, description="Include Grad-CAM from the first ensemble member"),
+    skip_gate: bool = Query(False, description="Skip vehicle OOD gate (for testing)"),
 ):
     """Predict using a named ensemble or an ad-hoc list of versions."""
     if ensemble and versions:
@@ -673,6 +734,7 @@ async def predict_ensemble(
         raise HTTPException(status_code=404, detail=str(e))
 
     image_bytes = await file.read()
+    _run_gate(image_bytes, skip_gate)
     img_array = preprocess_image(image_bytes)
 
     start_time = time.time()

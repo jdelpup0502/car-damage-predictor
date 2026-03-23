@@ -42,6 +42,14 @@ export default function PredictionResult({ result }: Props) {
             <span className="font-medium text-blue-700">enabled (8 views)</span>
           </>
         )}
+        {result.experiment && (
+          <>
+            <span>A/B Test</span>
+            <span className="font-medium text-purple-700">
+              {result.experiment} ({result.experiment_variant})
+            </span>
+          </>
+        )}
       </div>
     </div>
   );

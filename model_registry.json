@@ -45,5 +45,6 @@
       "description": "Base model + curriculum model ensemble",
       "created_at": "2026-03-19T00:38:49.284292+00:00"
     }
-  }
+  },
+  "experiments": {}
 }

@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS hard_examples (
     all_probabilities    TEXT NOT NULL,
     is_correct           INTEGER,
     is_hard              INTEGER NOT NULL DEFAULT 1,
-    mined_for_retraining INTEGER NOT NULL DEFAULT 0
+    mined_for_retraining INTEGER NOT NULL DEFAULT 0,
+    experiment_name      TEXT,
+    experiment_variant   TEXT
 )
 """
 
@@ -72,6 +74,12 @@ class HardExampleMiner:
     def _init_db(self):
         with self._conn() as conn:
             conn.execute(SCHEMA)
+            # Migrate existing DBs — ignore errors if columns already exist
+            for col in ("experiment_name TEXT", "experiment_variant TEXT"):
+                try:
+                    conn.execute(f"ALTER TABLE hard_examples ADD COLUMN {col}")
+                except Exception:
+                    pass
 
     @staticmethod
     def _compute_entropy(probabilities) -> float:
@@ -97,6 +105,8 @@ class HardExampleMiner:
         class_names: list,
         true_label: str = None,
         source: str = "api",
+        experiment_name: str = None,
+        experiment_variant: str = None,
     ) -> str:
         """
         Log a prediction. Always records metadata; saves image bytes to disk
@@ -140,8 +150,8 @@ class HardExampleMiner:
                     (id, timestamp, model_version, source, original_filename,
                      image_path, true_label, predicted_label, confidence, uncertainty,
                      difficulty_score, all_probabilities, is_correct, is_hard,
-                     mined_for_retraining)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                     mined_for_retraining, experiment_name, experiment_variant)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                 """,
                 (
                     example_id,
@@ -161,10 +171,70 @@ class HardExampleMiner:
                     ),
                     is_correct,
                     int(is_hard),
+                    experiment_name,
+                    experiment_variant,
                 ),
             )
 
         return example_id
+
+    def get_experiment_metrics(self, experiment_name: str) -> dict:
+        """Return per-variant metrics for an experiment."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    experiment_variant,
+                    COUNT(*) AS request_count,
+                    AVG(confidence) AS avg_confidence,
+                    AVG(uncertainty) AS avg_uncertainty,
+                    SUM(CASE WHEN true_label IS NOT NULL THEN 1 ELSE 0 END) AS labeled_count,
+                    SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) AS correct_count,
+                    predicted_label
+                FROM hard_examples
+                WHERE experiment_name = ?
+                GROUP BY experiment_variant, predicted_label
+                """,
+                (experiment_name,),
+            ).fetchall()
+
+        # Aggregate by variant
+        variants: dict = {}
+        for row in rows:
+            variant, req_count, avg_conf, avg_unc, labeled, correct, pred_label = row
+            if variant not in variants:
+                variants[variant] = {
+                    "request_count": 0,
+                    "avg_confidence": 0.0,
+                    "avg_uncertainty": 0.0,
+                    "labeled_count": 0,
+                    "correct_count": 0,
+                    "per_class": {},
+                    "_conf_sum": 0.0,
+                    "_unc_sum": 0.0,
+                }
+            v = variants[variant]
+            v["request_count"] += req_count
+            v["_conf_sum"] += (avg_conf or 0.0) * req_count
+            v["_unc_sum"] += (avg_unc or 0.0) * req_count
+            v["labeled_count"] += labeled
+            v["correct_count"] += correct
+            if pred_label:
+                v["per_class"][pred_label] = v["per_class"].get(pred_label, 0) + req_count
+
+        result = {}
+        for variant, v in variants.items():
+            n = v["request_count"]
+            labeled = v["labeled_count"]
+            result[variant] = {
+                "request_count": n,
+                "avg_confidence": round(v["_conf_sum"] / n, 4) if n else 0.0,
+                "avg_uncertainty": round(v["_unc_sum"] / n, 4) if n else 0.0,
+                "labeled_count": labeled,
+                "accuracy": round(v["correct_count"] / labeled, 4) if labeled else None,
+                "per_class": v["per_class"],
+            }
+        return result
 
     # -------------------------------------------------------------------------
     # Labelling

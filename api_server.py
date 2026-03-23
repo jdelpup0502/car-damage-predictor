@@ -3,6 +3,7 @@ import json
 import time
 import base64
 import os
+import random
 import numpy as np
 from datetime import datetime, timezone
 
@@ -215,6 +216,78 @@ class ModelRegistry:
             self._ensure_loaded(version)
             members.append((self._loaded[version], weight))
         return members
+
+    # -- A/B experiment management -------------------------------------------
+
+    def get_active_experiment(self) -> dict | None:
+        """Return the active experiment dict (with its name), or None."""
+        self._meta = self._read()
+        for name, exp in self._meta.get("experiments", {}).items():
+            if exp.get("status") == "active":
+                return {"name": name, **exp}
+        return None
+
+    def create_experiment(self, name: str, variants: list, description: str = "") -> dict:
+        """
+        Create and activate a new A/B experiment.
+
+        variants: list of {"version": str, "weight": float}
+        Raises ValueError if another experiment is already active or a version is unknown.
+        """
+        self._meta = self._read()
+        for v in variants:
+            if v["version"] not in self._meta["versions"]:
+                raise KeyError(f"Unknown version: {v['version']}")
+        if self.get_active_experiment():
+            raise ValueError("Another experiment is already active. Stop it first.")
+
+        total = sum(v["weight"] for v in variants)
+        normalized = [{"version": v["version"], "weight": v["weight"] / total} for v in variants]
+
+        exp = {
+            "variants": normalized,
+            "status": "active",
+            "description": description,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "stopped_at": None,
+        }
+        self._meta.setdefault("experiments", {})[name] = exp
+        self._write(self._meta)
+        return {"name": name, **exp}
+
+    def stop_experiment(self, name: str) -> dict:
+        """Stop a running experiment."""
+        self._meta = self._read()
+        experiments = self._meta.get("experiments", {})
+        if name not in experiments:
+            raise KeyError(f"Unknown experiment: {name}")
+        experiments[name]["status"] = "stopped"
+        experiments[name]["stopped_at"] = datetime.now(timezone.utc).isoformat()
+        self._write(self._meta)
+        return {"name": name, **experiments[name]}
+
+    def resolve_version_for_request(
+        self, explicit_version: str | None
+    ) -> tuple:
+        """
+        Decide which model version to use for this request.
+
+        Returns (version, experiment_name, experiment_variant):
+        - If explicit_version is given → bypass A/B, return (explicit_version, None, None)
+        - If no active experiment → (active_version, None, None)
+        - Otherwise → weighted random selection from the active experiment
+        """
+        if explicit_version:
+            return explicit_version, None, None
+
+        exp = self.get_active_experiment()
+        if not exp:
+            return self.active_version, None, None
+
+        versions = [v["version"] for v in exp["variants"]]
+        weights = [v["weight"] for v in exp["variants"]]
+        selected = random.choices(versions, weights=weights, k=1)[0]
+        return selected, exp["name"], selected
 
 
 registry = ModelRegistry(REGISTRY_PATH)
@@ -448,13 +521,11 @@ async def predict(
     version: str = Query(None, description="Model version to use (defaults to active)"),
     tta: bool = Query(False, description="Use test-time augmentation (8 augmented views averaged)"),
 ):
-    if version:
-        try:
-            artifacts = registry.get_version(version)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"Unknown version: {version}")
-    else:
-        artifacts = registry.get_active()
+    version_str, exp_name, exp_variant = registry.resolve_version_for_request(version)
+    try:
+        artifacts = registry.get_version(version_str)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown version: {version_str}")
 
     image_bytes = await file.read()
 
@@ -467,20 +538,21 @@ async def predict(
     inference_time = (time.time() - start_time) * 1000
 
     result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
-    used_version = version or registry.active_version
     entropy = round(predictive_entropy(probabilities), 4)
 
     miner.log_prediction(
         image_bytes=image_bytes,
         filename=file.filename,
-        model_version=used_version,
+        model_version=version_str,
         probabilities=probabilities,
         class_names=artifacts["class_names"],
         source="api",
+        experiment_name=exp_name,
+        experiment_variant=exp_variant,
     )
 
     response = {
-        "model_version": used_version,
+        "model_version": version_str,
         "prediction": result["prediction"],
         "confidence": result["confidence"],
         "all_probabilities": result["all_probabilities"],
@@ -494,6 +566,9 @@ async def predict(
         response["heatmap_png_base64"] = overlay_heatmap(image_bytes, cam)
     if tta:
         response["tta"] = True
+    if exp_name:
+        response["experiment"] = exp_name
+        response["experiment_variant"] = exp_variant
 
     return response
 
@@ -505,13 +580,11 @@ async def predict_batch(
     uncertainty: bool = Query(False, description="Include predictive entropy as uncertainty score"),
     version: str = Query(None, description="Model version to use (defaults to active)"),
 ):
-    if version:
-        try:
-            artifacts = registry.get_version(version)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"Unknown version: {version}")
-    else:
-        artifacts = registry.get_active()
+    version_str, exp_name, exp_variant = registry.resolve_version_for_request(version)
+    try:
+        artifacts = registry.get_version(version_str)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown version: {version_str}")
 
     images_bytes = [await f.read() for f in files]
     batch = np.concatenate([preprocess_image(b) for b in images_bytes], axis=0)
@@ -520,7 +593,6 @@ async def predict_batch(
     all_probs = list(artifacts["model"].predict(batch, verbose=0))
     total_inference_time = (time.time() - start_time) * 1000
 
-    used_version = version or registry.active_version
     results = []
     for i, probabilities in enumerate(all_probs):
         result = build_result(probabilities, artifacts["class_names"], CONFIDENCE_THRESHOLD)
@@ -529,10 +601,12 @@ async def predict_batch(
         miner.log_prediction(
             image_bytes=images_bytes[i],
             filename=files[i].filename,
-            model_version=used_version,
+            model_version=version_str,
             probabilities=probabilities,
             class_names=artifacts["class_names"],
             source="api_batch",
+            experiment_name=exp_name,
+            experiment_variant=exp_variant,
         )
 
         item = {
@@ -549,13 +623,17 @@ async def predict_batch(
             item["heatmap_png_base64"] = overlay_heatmap(images_bytes[i], cam)
         results.append(item)
 
-    return {
-        "model_version": used_version,
+    response = {
+        "model_version": version_str,
         "results": results,
         "total_images": len(files),
         "total_inference_time_ms": round(total_inference_time, 2),
         "avg_inference_time_ms": round(total_inference_time / len(files), 2),
     }
+    if exp_name:
+        response["experiment"] = exp_name
+        response["experiment_variant"] = exp_variant
+    return response
 
 
 @app.post("/predict/ensemble")
@@ -688,6 +766,62 @@ async def export_hard_examples(
     """
     result = miner.export_dataset(output_dir, strategy, threshold, only_labeled)
     return result
+
+
+# ---------------------------------------------------------------------------
+# A/B Testing endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/experiments")
+async def create_experiment(
+    name: str = Body(..., description="Unique experiment name"),
+    variants: list = Body(..., description="List of {version, weight} dicts"),
+    description: str = Body("", description="Optional description"),
+):
+    """Create and activate a new A/B experiment."""
+    try:
+        result = registry.create_experiment(name, variants, description)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
+
+
+@app.get("/experiments")
+async def list_experiments():
+    """List all experiments (active and stopped)."""
+    registry._meta = registry._read()
+    return [
+        {"name": name, **exp}
+        for name, exp in registry._meta.get("experiments", {}).items()
+    ]
+
+
+@app.post("/experiments/{name}/stop")
+async def stop_experiment(name: str):
+    """Stop an active experiment."""
+    try:
+        return registry.stop_experiment(name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/experiments/{name}/metrics")
+async def experiment_metrics(name: str):
+    """Return per-variant metrics for an experiment."""
+    registry._meta = registry._read()
+    experiments = registry._meta.get("experiments", {})
+    if name not in experiments:
+        raise HTTPException(status_code=404, detail=f"Unknown experiment: {name}")
+    exp = experiments[name]
+    variants_data = miner.get_experiment_metrics(name)
+    return {
+        "experiment": name,
+        "status": exp["status"],
+        "variants": variants_data,
+        "total_requests": sum(v["request_count"] for v in variants_data.values()),
+    }
 
 
 @app.get("/health")
